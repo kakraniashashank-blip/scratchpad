@@ -1034,6 +1034,9 @@
   var voiceMenu = document.getElementById('voice-menu');
   var synth = window.speechSynthesis;
   var allVoices = []; var selectedVoiceObj = null; var speechChunks = []; var speechIdx = 0; var keepAliveTimer;
+  var activeUtterance = null;
+  var chunkTimeout = null;
+  var isSpeakingManuallyStopped = true;
   var currentSpeed = parseFloat(load(PREF_SPEED)) || 1.0;
   var SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
@@ -1052,7 +1055,7 @@
     currentSpeed = speed;
     store(PREF_SPEED, speed.toString());
     closeAllMenus();
-    if (synth.speaking || synth.pending || readBtn.textContent === '⏹️ Stop') {
+    if (!isSpeakingManuallyStopped && (synth.speaking || synth.pending || readBtn.textContent === '⏹️ Stop')) {
       restartSpeech();
     }
     showToast('Speed: ' + speed + '×');
@@ -1114,7 +1117,7 @@
         e.stopPropagation(); store(PREF_VOICE, voice.name); selectedVoiceObj = voice;
         var currentActive = voiceMenu.querySelector('.active-voice'); if(currentActive) currentActive.classList.remove('active-voice');
         item.classList.add('active-voice'); closeAllMenus();
-        if (synth.speaking || synth.pending || readBtn.textContent === '⏹️ Stop') { restartSpeech(); } ed.focus();
+        if (!isSpeakingManuallyStopped && (synth.speaking || synth.pending || readBtn.textContent === '⏹️ Stop')) { restartSpeech(); } ed.focus();
       };
       voiceMenu.appendChild(item);
     });
@@ -1123,33 +1126,136 @@
   if (speechSynthesis.onvoiceschanged !== undefined) speechSynthesis.onvoiceschanged = renderVoiceMenu;
   voiceToggle.onclick = function(e) { e.stopPropagation(); renderVoiceMenu(); toggleMenu(voiceMenu, voiceToggle, 'block'); };
 
+  function chunkText(text) {
+    var rawChunks = text.match(/[^.!?\n\r]+[.!?\n\r]*\s*/g) || [text];
+    var safeChunks = [];
+    rawChunks.forEach(function(raw) {
+      var s = raw.trim();
+      if (!s) return;
+      if (s.length <= 160) {
+        safeChunks.push(s);
+        return;
+      }
+      var subParts = s.match(/[^,;:—]+[,;:—]*\s*/g) || [s];
+      var buf = '';
+      subParts.forEach(function(part) {
+        if ((buf + part).length <= 160) {
+          buf += part;
+        } else {
+          if (buf.trim()) safeChunks.push(buf.trim());
+          if (part.length <= 160) {
+            buf = part;
+          } else {
+            var words = part.split(/\s+/);
+            var wBuf = '';
+            words.forEach(function(w) {
+              if ((wBuf + ' ' + w).length <= 160) {
+                wBuf = (wBuf ? wBuf + ' ' : '') + w;
+              } else {
+                if (wBuf.trim()) safeChunks.push(wBuf.trim());
+                wBuf = w;
+              }
+            });
+            buf = wBuf;
+          }
+        }
+      });
+      if (buf.trim()) safeChunks.push(buf.trim());
+    });
+    return safeChunks;
+  }
+
+  function stopSpeech() {
+    isSpeakingManuallyStopped = true;
+    clearTimeout(chunkTimeout);
+    if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+    activeUtterance = null;
+    if (synth) {
+      try { synth.cancel(); } catch(e){}
+    }
+    readBtn.textContent = '🗣️ Read';
+  }
+
   function speakNextChunk() {
-    if (speechIdx >= speechChunks.length) { readBtn.textContent = '🗣️ Read'; clearInterval(keepAliveTimer); return; }
-    var utt = new SpeechSynthesisUtterance(speechChunks[speechIdx]);
-    if (!selectedVoiceObj) selectedVoiceObj = getBestVoice(); if (selectedVoiceObj) utt.voice = selectedVoiceObj;
+    clearTimeout(chunkTimeout);
+    if (isSpeakingManuallyStopped) return;
+    if (!speechChunks || speechIdx >= speechChunks.length) {
+      stopSpeech();
+      return;
+    }
+
+    var chunk = speechChunks[speechIdx];
+    if (!chunk || !chunk.trim()) {
+      speechIdx++;
+      speakNextChunk();
+      return;
+    }
+
+    var utt = new SpeechSynthesisUtterance(chunk);
+    activeUtterance = utt;
+
+    if (!selectedVoiceObj) selectedVoiceObj = getBestVoice();
+    if (selectedVoiceObj) {
+      utt.voice = selectedVoiceObj;
+      utt.lang = selectedVoiceObj.lang || 'en-US';
+    } else {
+      utt.lang = 'en-US';
+    }
     utt.rate = currentSpeed;
-    utt.onend = function() { speechIdx++; speakNextChunk(); };
-    utt.onerror = function() { readBtn.textContent = '🗣️ Read'; clearInterval(keepAliveTimer); };
-    synth.speak(utt);
+
+    var hasEnded = false;
+    function advance() {
+      if (hasEnded) return;
+      hasEnded = true;
+      clearTimeout(chunkTimeout);
+      activeUtterance = null;
+      if (!isSpeakingManuallyStopped) {
+        speechIdx++;
+        speakNextChunk();
+      }
+    }
+
+    utt.onend = advance;
+    utt.onerror = function(e) {
+      if (isSpeakingManuallyStopped || (e && (e.error === 'interrupted' || e.error === 'canceled'))) {
+        return;
+      }
+      advance();
+    };
+
+    chunkTimeout = setTimeout(function() {
+      if (!hasEnded && !isSpeakingManuallyStopped) {
+        advance();
+      }
+    }, 10000);
+
+    try {
+      synth.speak(utt);
+    } catch(err) {
+      advance();
+    }
   }
 
   function restartSpeech() {
-    synth.cancel();
-    clearInterval(keepAliveTimer);
+    stopSpeech();
     var selectedText = window.getSelection().toString();
     var textToRead = selectedText || ed.innerText;
-    if (!textToRead.trim()) { readBtn.textContent = '🗣️ Read'; return; }
-    speechChunks = textToRead.match(/[^.!?]+[.!?]*\s*/g) || [textToRead];
+    if (!textToRead.trim()) return;
+
+    speechChunks = chunkText(textToRead);
+    if (speechChunks.length === 0) return;
+
     speechIdx = 0;
+    isSpeakingManuallyStopped = false;
     readBtn.textContent = '⏹️ Stop';
-    keepAliveTimer = setInterval(function(){ if(synth.speaking && !synth.paused) { synth.pause(); synth.resume(); } }, 10000);
     speakNextChunk();
   }
 
   readBtn.onclick = function(e) {
     if(e) e.stopPropagation(); closeAllMenus();
-    if (synth.speaking || synth.pending || synth.paused || readBtn.textContent === '⏹️ Stop') {
-      synth.cancel(); clearInterval(keepAliveTimer); readBtn.textContent = '🗣️ Read'; return;
+    if (!isSpeakingManuallyStopped && (synth.speaking || synth.pending || readBtn.textContent === '⏹️ Stop')) {
+      stopSpeech();
+      return;
     }
     restartSpeech();
     ed.focus();
